@@ -1,6 +1,4 @@
 #GDBOX
-===========
-
 Command line tool for accessing dropbox written in go.
 
 features:
