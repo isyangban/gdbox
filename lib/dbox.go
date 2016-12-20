@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -16,13 +18,16 @@ import (
 type dboxConst struct {
 	MaxFileLimit          int
 	DirectUploadSizeLimit int
+	MaxTryLimit           int
 }
 
 var kDboxConst = dboxConst{
 	MaxFileLimit:          10000,
 	DirectUploadSizeLimit: 15 * 1000 * 1000,
+	MaxTryLimit:           5,
 }
 
+//Todo: change Metadata, Client, Addauthheader to private variable/Functions
 type Dropbox struct {
 	Account  Account
 	Token    Token
@@ -37,6 +42,8 @@ func NewDropbox(token Token) *Dropbox {
 	dbox.Metadata = make(map[string]Metadata)
 	return dbox
 }
+
+// Delete this method and change to sperate function
 func (dbox *Dropbox) AddAuthHeader(r *http.Request) {
 	//var auth_header = "Bearer <YOUR_ACCESS_TOKEN_HERE>"
 	r.Header.Add("Authorization", "Bearer "+dbox.Token.AccessToken)
@@ -291,8 +298,6 @@ func (dbox *Dropbox) Download(remote_path string, local_path string) error {
 		if len(body) != metadata.Bytes {
 			fmt.Println("Download size does not match, download: ", len(body), " expected: ", metadata.Bytes)
 		}
-		// Need complete rewrite using path.filepath
-		// user os.MkdriAll and ioutil.WriteFile(x, x, 0644)
 		os.MkdirAll(filepath.Dir(local_path), 0755)
 		stat, err := os.Stat(local_path)
 		if err != nil {
@@ -318,5 +323,105 @@ func (dbox *Dropbox) Download(remote_path string, local_path string) error {
 		return nil
 	default:
 		return errors.New(resp.Status)
+	}
+}
+
+func (dbox *Dropbox) Upload(remote_path string, local_path string) error {
+	//"Content-Type: application/octet-stream"?
+	parm := url.Values{"overwrite": {"true"}, "autorename": {"true"}}
+	files := GetSubfileNames(local_path, 100)
+	for _, file := range files {
+		f, err := os.Open(file)
+		defer f.Close()
+		if err != nil {
+			fmt.Println("Error opening file: ", err)
+			continue
+		}
+		file_stats, err := f.Stat()
+		//Use Chunck Upload if file size is bigger than DirectUpload Size Limit
+		if file_stats.Size() > kDboxConst.DirectUploadSizeLimit {
+			sf := io.NewSectionReader(f, 0, kDboxConst.DirectUploadSizeLimit)
+			upload_id, offset, err := dbox.chunkedUpload("", sf, 0)
+			for sf.Size() > 0 {
+				upload_id, offset, _ = dbox.chunkedUpload(upload_id, sf, offset)
+				sf = io.NewSectionReader(f, offset, kDboxConst.DirectUploadSizeLimit)
+			}
+			_, err := dbox.commitChunkedUpload(remote_path, upload_id)
+			if err != nil {
+				fmt.Println(err)
+			}
+		} else { //Use Direct Upload
+			err := directUpload(remote_path, f)
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+
+	}
+	return nil
+}
+
+func (dbox *Dropbox) directUpload(remote_path string, fd os.File) error {
+	req, _ := http.NewRequest("PUT", "https://api-content.dropbox.com/1/files_put/auto/"+url.QueryEscape(remote_path)+"?"+parm.Encode(), f)
+	stat, _ := fd.Stat()
+	req.Header.Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+	dbox.AddAuthHeader(req)
+	//Need to set content-type?
+	resp, _ := dbox.Client.Do(req)
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		return nil
+	default:
+		return errors.New(resp.Status)
+	}
+}
+
+type chunkedFile struct {
+	UploadId string `json:"upload_id"`
+	Offset   int64  `json:"offset"`
+	Expires  string `json:"expires"`
+}
+
+// changee io.SectionReader to io.Reader...
+func (dbox *Dropbox) chunkedUpload(upload_id string, sf *io.Reader, offset int64) (string, int64, error) {
+	parm := url.Values{}
+	if upload_id == "" {
+		parm.Add("offset", "0")
+	} else {
+		parm.Add("offset", strconv.FormatInt(offset, 10))
+		parm.Add("upload_id", upload_id)
+	}
+	req, _ := http.NewRequest("PUT", "https://api-content.dropbox.com/1/chunked_upload"+"?"+parm.Encode(), sf)
+	dbox.AddAuthHeader(req)
+	resp, _ := dbox.Client.Do(req)
+	chunked_file := new(chunkedFile)
+	body, _ := ioutil.ReadAll(resp.Body)
+	err := json.Unmarshal(body, chunked_file)
+	if err != nil {
+		fmt.Println(err)
+		return "", offset, err
+	}
+	return chunked_file.UploadId, chunked_file.Offset, nil
+}
+
+func (dbox *Dropbox) commitChunkedUpload(remote_path string, upload_id string) (Metadata, error) {
+	parm := url.Values{"upload_id": {upload_id}, "overwrite": {"true"}, "autorename": {"true"}}
+	req, _ := http.NewRequest("POST",
+		"https://content.dropboxapi.com/1/commit_chunked_upload/auto/"+url.QueryEscape(remote_path), strings.NewReader(parm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	dbox.AddAuthHeader(req)
+	resp, _ := dbox.Client.Do(req)
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 400:
+		return Metadata{}, errors.New("Invalid upload id: " + upload_id + "or chunked file does not exist")
+	case 409:
+		return Metadata{}, errors.New("Conflict with existing file")
+	case 200:
+		body, _ := ioutil.ReadAll(resp.Body)
+		return *NewMetadata(body), nil
+	default:
+		return Metadata{}, errors.New(resp.Status)
 	}
 }

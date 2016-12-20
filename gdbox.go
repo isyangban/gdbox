@@ -6,12 +6,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -70,6 +67,7 @@ func (c *Config) ToToken() *Token {
 	return &token
 }
 
+// Change hanlder to handler -> handlerdownlaod, handler upload etc...
 func handler(flag *flag.FlagSet) {
 	command := flag.Arg(0)
 	client := &http.Client{}
@@ -277,102 +275,6 @@ func Setup() Token {
 	}
 	token, _ := Oath2Athorize(app_key, secret_key, auth_code)
 	return token
-}
-
-func Upload(c *http.Client, remote_path string, local_path string, token *Token) error {
-	//"Content-Type: application/octet-stream"?
-	parm := url.Values{"overwrite": {"true"}, "autorename": {"true"}}
-	files := GetSubfileNames(local_path, 100)
-	for _, file := range files {
-		f, err := os.Open(file)
-		defer f.Close()
-		if err != nil {
-			fmt.Println("Error opening file: ", err)
-			continue
-		}
-		file_stats, err := f.Stat()
-		//Use Chunck Upload if file size is bigger than 20MB
-		if file_stats.Size() > 20*1024*1024 {
-			sf := io.NewSectionReader(f, 0, 20*1024*1024)
-			upload_id, offset, _ := chunkedUpload(c, "", sf, 0, token)
-			for sf.Size() > 0 {
-				upload_id, offset, _ = chunkedUpload(c, upload_id, sf, offset, token)
-				sf = io.NewSectionReader(f, 0, 20*1024*1024)
-			}
-			_, err := commitChunkedUpload(c, remote_path, upload_id, kConfig.ToToken())
-			if err != nil {
-				return err
-			}
-		} else {
-			//Use Direct Upload
-
-		}
-
-	}
-	return nil
-}
-
-func directUpload(c *http.Client, remote_path string, fd os.File, token *Token) {
-	req, _ := http.NewRequest("PUT", "https://api-content.dropbox.com/1/files_put/auto/"+url.QueryEscape(remote_path)+"?"+parm.Encode(), f)
-	req.Header.Set("Content-Length", strconv.FormatInt(file_stats.Size(), 10))
-	AddAuthHeader(req, token)
-	//Need to set content-type?
-	resp, _ := c.Do(req)
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case 200:
-		return nil
-	default:
-		return errors.New(resp.Status)
-	}
-}
-
-type ChunkedFile struct {
-	UploadId string `json:"upload_id"`
-	Offset   int64  `json:"offset"`
-	Expires  string `json:"expires"`
-}
-
-// changee io.SectionReader to io.Reader...
-func chunkedUpload(c *http.Client, upload_id string, sf *io.SectionReader, offset int64, token *Token) (string, int64, error) {
-	parm := url.Values{}
-	if upload_id == "" {
-		parm.Add("offset", "0")
-	} else {
-		parm.Add("offset", strconv.FormatInt(offset, 10))
-		parm.Add("upload_id", upload_id)
-	}
-	req, _ := http.NewRequest("PUT", "https://api-content.dropbox.com/1/chunked_upload"+"?"+parm.Encode(), sf)
-	AddAuthHeader(req, token)
-	resp, _ := c.Do(req)
-	chunked_file := new(ChunkedFile)
-	body, _ := ioutil.ReadAll(resp.Body)
-	err := json.Unmarshal(body, chunked_file)
-	if err != nil {
-		fmt.Println(err)
-		return "", offset, err
-	}
-	return chunked_file.UploadId, chunked_file.Offset, nil
-}
-
-func commitChunkedUpload(c *http.Client, remote_path string, upload_id string, token *Token) (Metadata, error) {
-	parm := url.Values{"upload_id": {upload_id}, "overwrite": {"true"}, "autorename": {"true"}}
-	req, _ := http.NewRequest("POST", "https://content.dropboxapi.com/1/commit_chunked_upload/auto/"+url.QueryEscape(remote_path), strings.NewReader(parm.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	AddAuthHeader(req, token)
-	resp, _ := c.Do(req)
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case 400:
-		return Metadata{}, errors.New("Invalid upload id: " + upload_id + "or chunked file does not exist")
-	case 409:
-		return Metadata{}, errors.New("Conflict with existing file")
-	case 200:
-		body, _ := ioutil.ReadAll(resp.Body)
-		return *NewMetadata(body), nil
-	default:
-		return Metadata{}, errors.New(resp.Status)
-	}
 }
 
 // Rename this function and change parameter
